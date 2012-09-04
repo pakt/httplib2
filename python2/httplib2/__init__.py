@@ -43,6 +43,14 @@ import calendar
 import time
 import random
 import errno
+
+TIME_CONNECT = "Connect"
+TIME_PRETRANSFER = "Pretransfer"
+TIME_START_TRANSFER = "Start transfer"
+TIME_REDIRECT = "Redirect"
+TIME_TOTAL = "Total"
+DATA_SIZE = "Data size"
+
 try:
     from hashlib import sha1 as _sha, md5 as _md5
 except ImportError:
@@ -657,7 +665,7 @@ class GoogleLoginAuthentication(Authentication):
         #    service = "wise"
 
         auth = dict(Email=credentials[0], Passwd=credentials[1], service=service, source=headers['user-agent'])
-        resp, content = self.http.request("https://www.google.com/accounts/ClientLogin", method="POST", body=urlencode(auth), headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        resp, content, _ = self.http.request("https://www.google.com/accounts/ClientLogin", method="POST", body=urlencode(auth), headers={'Content-Type': 'application/x-www-form-urlencoded'})
         lines = content.split('\n')
         d = dict([tuple(line.split("=", 1)) for line in lines if line])
         if resp.status == 403:
@@ -893,6 +901,7 @@ class HTTPConnectionWithTimeout(httplib.HTTPConnection):
                         print "proxy: %s ************" % str((proxy_host, proxy_port, proxy_rdns, proxy_user, proxy_pass))
 
                 self.sock.connect((self.host, self.port) + sa[2:])
+                time_connect = time.time()
             except socket.error, msg:
                 if self.debuglevel > 0:
                     print "connect fail: (%s, %s)" % (self.host, self.port)
@@ -905,6 +914,10 @@ class HTTPConnectionWithTimeout(httplib.HTTPConnection):
             break
         if not self.sock:
             raise socket.error, msg
+
+        time_pretransfer = time_connect
+        return time_connect, time_pretransfer
+
 
 class HTTPSConnectionWithTimeout(httplib.HTTPSConnection):
     """
@@ -1009,9 +1022,13 @@ class HTTPSConnectionWithTimeout(httplib.HTTPSConnection):
                 if has_timeout(self.timeout):
                     sock.settimeout(self.timeout)
                 sock.connect((self.host, self.port))
+                time_connect = time.time()
+
                 self.sock =_ssl_wrap_socket(
                     sock, self.key_file, self.cert_file,
                     self.disable_ssl_certificate_validation, self.ca_certs)
+                time_pretransfer = time.time()
+
                 if self.debuglevel > 0:
                     print "connect: (%s, %s)" % (self.host, self.port)
                     if use_proxy:
@@ -1049,8 +1066,12 @@ class HTTPSConnectionWithTimeout(httplib.HTTPSConnection):
               self.sock = None
               continue
             break
+
         if not self.sock:
           raise socket.error, msg
+
+        return time_connect, time_pretransfer
+
 
 SCHEME_TO_CONNECTION = {
     'http': HTTPConnectionWithTimeout,
@@ -1265,7 +1286,9 @@ and more.
         for i in range(RETRIES):
             try:
                 if conn.sock is None:
-                  conn.connect()
+                  (time_connect, time_pretransfer) = conn.connect()
+                else:
+                  time_connect = time_pretransfer = time.time()
                 conn.request(method, request_uri, body, headers)
             except socket.timeout:
                 raise
@@ -1289,21 +1312,22 @@ and more.
                 if conn.sock is None:
                     if i < RETRIES-1:
                         conn.close()
-                        conn.connect()
+                        (time_connect, time_pretransfer) = conn.connect()
                         continue
                     else:
                         conn.close()
                         raise
                 if i < RETRIES-1:
                     conn.close()
-                    conn.connect()
+                    (time_connect, time_pretransfer) = conn.connect()
                     continue
             try:
                 response = conn.getresponse()
+                time_start_transfer = time.time()
             except (socket.error, httplib.HTTPException):
                 if i < RETRIES-1:
                     conn.close()
-                    conn.connect()
+                    (time_connect, time_pretransfer) = conn.connect()
                     continue
                 else:
                     raise
@@ -1313,11 +1337,18 @@ and more.
                     conn.close()
                 else:
                     content = response.read()
+                    time_total = time.time()
+                    data_size = len(content)
                 response = Response(response)
                 if method != "HEAD":
                     content = _decompressContent(response, content)
             break
-        return (response, content)
+        stats = {TIME_CONNECT: time_connect, 
+                TIME_PRETRANSFER: time_pretransfer,
+                TIME_START_TRANSFER: time_start_transfer,
+                TIME_TOTAL: time_total,
+                DATA_SIZE: data_size}
+        return (response, content, stats)
 
 
     def _request(self, conn, host, absolute_uri, request_uri, method, body, headers, redirections, cachekey):
@@ -1329,18 +1360,19 @@ and more.
         if auth:
             auth.request(method, request_uri, headers, body)
 
-        (response, content) = self._conn_request(conn, request_uri, method, body, headers)
+        (response, content, stats) = self._conn_request(conn, request_uri, method, body, headers)
+        time_redirect = stats[TIME_TOTAL]
 
         if auth:
             if auth.response(response, body):
                 auth.request(method, request_uri, headers, body)
-                (response, content) = self._conn_request(conn, request_uri, method, body, headers )
+                (response, content, stats) = self._conn_request(conn, request_uri, method, body, headers )
                 response._stale_digest = 1
 
         if response.status == 401:
             for authorization in self._auth_from_challenge(host, request_uri, headers, response, content):
                 authorization.request(method, request_uri, headers, body)
-                (response, content) = self._conn_request(conn, request_uri, method, body, headers, )
+                (response, content, stats) = self._conn_request(conn, request_uri, method, body, headers, )
                 if response.status != 401:
                     self.authorizations.append(authorization)
                     authorization.response(response, body)
@@ -1379,7 +1411,8 @@ and more.
                         if response.status in [302, 303]:
                             redirect_method = "GET"
                             body = None
-                        (response, content) = self.request(location, redirect_method, body=body, headers = headers, redirections = redirections - 1)
+                        (response, content, _) = self.request(location, redirect_method, body=body, headers = headers, redirections = redirections - 1)
+                        time_redirect = time.time()
                         response.previous = old_response
                 else:
                     raise RedirectLimit("Redirected more times than rediection_limit allows.", response, content)
@@ -1389,7 +1422,8 @@ and more.
                     response['content-location'] = absolute_uri
                 _updateCache(headers, response, content, self.cache, cachekey)
 
-        return (response, content)
+        stats[TIME_REDIRECT] = time_redirect
+        return (response, content, stats)
 
     def _normalize_headers(self, headers):
         return _normalize_headers(headers)
@@ -1420,6 +1454,7 @@ The return value is a tuple of (response, content), the first
 being and instance of the 'Response' class, the second being
 a string that contains the response entity body.
         """
+        time_start = time.time()
         try:
             if headers is None:
                 headers = {}
@@ -1520,7 +1555,7 @@ a string that contains the response entity body.
                     # Should cached permanent redirects be counted in our redirection count? For now, yes.
                     if redirections <= 0:
                       raise RedirectLimit("Redirected more times than rediection_limit allows.", {}, "")
-                    (response, new_content) = self.request(info['-x-permanent-redirect-url'], "GET", headers = headers, redirections = redirections - 1)
+                    (response, new_content, stats) = self.request(info['-x-permanent-redirect-url'], "GET", headers = headers, redirections = redirections - 1)
                     response.previous = Response(info)
                     response.previous.fromcache = True
                 else:
@@ -1551,7 +1586,7 @@ a string that contains the response entity body.
                     elif entry_disposition == "TRANSPARENT":
                         pass
 
-                    (response, new_content) = self._request(conn, authority, uri, request_uri, method, body, headers, redirections, cachekey)
+                    (response, new_content, stats) = self._request(conn, authority, uri, request_uri, method, body, headers, redirections, cachekey)
 
                 if response.status == 304 and method == "GET":
                     # Rewrite the cache entry with the new end-to-end headers
@@ -1581,7 +1616,7 @@ a string that contains the response entity body.
                     response = Response(info)
                     content = ""
                 else:
-                    (response, content) = self._request(conn, authority, uri, request_uri, method, body, headers, redirections, cachekey)
+                    (response, content, stats) = self._request(conn, authority, uri, request_uri, method, body, headers, redirections, cachekey)
         except Exception, e:
             if self.force_exception_to_status_code:
                 if isinstance(e, HttpLib2ErrorWithResponse):
@@ -1605,11 +1640,16 @@ a string that contains the response entity body.
                             "content-length": len(content)
                             })
                     response.reason = "Bad Request"
+                stats = {}
             else:
                 raise
 
+        for k,t in stats.iteritems():
+            if k == DATA_SIZE:
+                continue
+            stats[k] = t-time_start
 
-        return (response, content)
+        return (response, content, stats)
 
     def _get_proxy_info(self, scheme, authority):
         """Return a ProxyInfo instance (or None) based on the scheme
